@@ -9,7 +9,7 @@ logging.basicConfig(filename='/var/ossec/logs/custom-yeti.log', level=logging.DE
                     format='%(asctime)s %(levelname)s: %(message)s')
 
 # Hardcoded Yeti API key and host details
-YETI_API_KEY = "b177c1c34dd8a10c8e62a8d166af05caee6340d1efedc254248f960eabee3a75"
+YETI_API_KEY = "b177--------a10c----------------54248f9--3a75"
 YETI_HOST = "http://192.168.10.131:8000"
 YETI_AUTH_URL = f"{YETI_HOST}/api/v2/auth/api-token"
 YETI_IMPORT_URL = f"{YETI_HOST}/api/v2/observables/import/text"
