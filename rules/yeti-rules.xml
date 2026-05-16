@@ -1,0 +1,99 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Custom Wazuh Rules – Yeti Threat Intelligence Integration
+  File: /var/ossec/etc/rules/yeti-rules.xml
+
+  These rules fire when the custom-yeti integration script finds a match
+  in the Yeti threat intelligence platform and injects a synthetic alert.
+
+  Rule ID range used: 100200–100210  (local rules block)
+  Adjust if they conflict with other custom rules in your environment.
+-->
+
+<group name="yeti,threat-intelligence,ioc,">
+
+  <!-- ────────────────────────────────────────────────────────────────────────
+       Rule 100200 – Base rule: any Yeti response received
+       ──────────────────────────────────────────────────────────────────────── -->
+  <rule id="100200" level="3">
+    <decoded_as>yeti-integration</decoded_as>
+    <description>Yeti Threat Intelligence: lookup performed</description>
+    <group>yeti,</group>
+    <options>no_full_log</options>
+  </rule>
+
+  <!-- ────────────────────────────────────────────────────────────────────────
+       Rule 100201 – Threat and IOC Found  (the one shown on the dashboard)
+       Level 12 = Critical.  Change to 15 for maximum severity.
+       ──────────────────────────────────────────────────────────────────────── -->
+  <rule id="100201" level="12">
+    <if_sid>100200</if_sid>
+    <field name="yeti.result">Threat and IOC Found</field>
+    <description>Threat and IOC Found: $(yeti.ioc_count) indicator(s) matched in Yeti for agent $(agent.name)</description>
+    <group>yeti,ioc_found,threat_intel,</group>
+    <options>no_full_log</options>
+    <!-- MITRE ATT&CK tagging – adjust tactic/technique to your environment -->
+    <mitre>
+      <id>T1071</id>   <!-- Command and Control: Application Layer Protocol -->
+      <id>T1566</id>   <!-- Initial Access: Phishing -->
+    </mitre>
+  </rule>
+
+  <!-- ────────────────────────────────────────────────────────────────────────
+       Rule 100202 – Malicious IP specifically found
+       ──────────────────────────────────────────────────────────────────────── -->
+  <rule id="100202" level="12">
+    <if_sid>100201</if_sid>
+    <field name="yeti.iocs.0.type">ip</field>
+    <description>Threat and IOC Found: Malicious IP address detected for agent $(agent.name)</description>
+    <group>yeti,ioc_found,malicious_ip,</group>
+    <options>no_full_log</options>
+    <mitre>
+      <id>T1071.001</id>  <!-- C2 over Web Protocols -->
+    </mitre>
+  </rule>
+
+  <!-- ────────────────────────────────────────────────────────────────────────
+       Rule 100203 – Malicious domain / hostname found
+       ──────────────────────────────────────────────────────────────────────── -->
+  <rule id="100203" level="12">
+    <if_sid>100201</if_sid>
+    <field name="yeti.iocs.0.type">hostname</field>
+    <description>Threat and IOC Found: Malicious domain/hostname detected for agent $(agent.name)</description>
+    <group>yeti,ioc_found,malicious_domain,</group>
+    <options>no_full_log</options>
+    <mitre>
+      <id>T1568</id>   <!-- Dynamic Resolution -->
+    </mitre>
+  </rule>
+
+  <!-- ────────────────────────────────────────────────────────────────────────
+       Rule 100204 – Malicious file hash found
+       ──────────────────────────────────────────────────────────────────────── -->
+  <rule id="100204" level="14">
+    <if_sid>100201</if_sid>
+    <field name="yeti.iocs.0.type">md5|sha1|sha256</field>
+    <description>Threat and IOC Found: Malicious file hash detected for agent $(agent.name) — possible malware execution</description>
+    <group>yeti,ioc_found,malicious_hash,malware,</group>
+    <options>no_full_log</options>
+    <mitre>
+      <id>T1204</id>   <!-- User Execution -->
+      <id>T1059</id>   <!-- Command and Scripting Interpreter -->
+    </mitre>
+  </rule>
+
+  <!-- ────────────────────────────────────────────────────────────────────────
+       Rule 100205 – Malicious URL found
+       ──────────────────────────────────────────────────────────────────────── -->
+  <rule id="100205" level="12">
+    <if_sid>100201</if_sid>
+    <field name="yeti.iocs.0.type">url</field>
+    <description>Threat and IOC Found: Malicious URL detected for agent $(agent.name)</description>
+    <group>yeti,ioc_found,malicious_url,</group>
+    <options>no_full_log</options>
+    <mitre>
+      <id>T1566.002</id>  <!-- Phishing: Spearphishing Link -->
+    </mitre>
+  </rule>
+
+</group>

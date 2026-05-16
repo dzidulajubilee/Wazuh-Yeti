@@ -1,0 +1,69 @@
+<!--
+  ============================================================================
+  Wazuh ossec.conf – Yeti Integration snippet
+  ============================================================================
+  Add the <integration> block below inside the <ossec_config> section of
+  /var/ossec/etc/ossec.conf on your Wazuh MANAGER node.
+
+  The full path to the integration script must be executable by the
+  ossec user (see the README for chmod / chown instructions).
+  ============================================================================
+-->
+
+<ossec_config>
+
+  <!-- ── Yeti Threat Intelligence Integration ──────────────────────────── -->
+  <integration>
+    <!--
+      Name must match the filename placed in /var/ossec/integrations/.
+      Wazuh will look for:
+        /var/ossec/integrations/custom-yeti          (the Python script)
+    -->
+    <name>custom-yeti</name>
+
+    <!--
+      hook_url is passed to the script as argv[2] (not used by our script
+      directly, but Wazuh requires it if api_key is also present).
+      Set this to your Yeti base URL for documentation purposes.
+    -->
+    <hook_url>http://YOUR_YETI_HOST:8000</hook_url>
+
+    <!--
+      Your Yeti API key. Wazuh passes this to the script as argv[3].
+      Generate it from your Yeti user profile page.
+    -->
+    <api_key>YOUR_YETI_API_KEY</api_key>
+
+    <!--
+      alert_format must be "json" so the script receives the full
+      structured Wazuh alert.
+    -->
+    <alert_format>json</alert_format>
+
+    <!--
+      level: only forward alerts at or above this severity level to Yeti.
+      Recommended starting point: 5 (medium).
+      Lower = more lookups = more Yeti API calls.
+    -->
+    <level>5</level>
+
+    <!--
+      (Optional) Comma-separated list of rule IDs to restrict lookups.
+      Remove or leave empty to apply to ALL rules at or above <level>.
+
+      Examples of useful rule IDs to target:
+        5501, 5502        – PAM authentication failures
+        31103, 31530      – Web attack signatures
+        87700             – Vulnerability detected (Vuls integration)
+        100001-100099     – Your own custom network rules
+    -->
+    <!-- <rule_id>31103,5501,5502</rule_id> -->
+
+    <!--
+      (Optional) Restrict by rule groups (comma-separated).
+      Useful to target only network / web / authentication events.
+    -->
+    <!-- <group>authentication_failed,web,network,</group> -->
+  </integration>
+
+</ossec_config>

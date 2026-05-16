@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Wazuh Decoder for Yeti Threat Intelligence Integration
+  File: /var/ossec/etc/decoders/yeti-decoder.xml
+
+  Decodes synthetic events injected by the custom-yeti integration script.
+  These events arrive via the Wazuh queue socket with location "yeti-ioc-integration".
+-->
+
+<decoder name="yeti-integration">
+  <!--
+    Match events whose syslog 'program name' / location field is our integration.
+    Wazuh sets this from the "1:<location>:<json>" socket message format.
+  -->
+  <prematch>{"integration":"yeti"</prematch>
+</decoder>
+
+<decoder name="yeti-integration-result">
+  <parent>yeti-integration</parent>
+  <use_own_name>yes</use_own_name>
+
+  <!-- Pull the top-level fields from the JSON payload -->
+  <plugin_decoder>JSON_Decoder</plugin_decoder>
+</decoder>

@@ -1,258 +1,343 @@
-#!/var/ossec/framework/python/bin/python3
 # Copyright (C) 2025, DZIDULA JUBILEE GATI
-#
-# Licensed under the AGPL-3.0 License.
-# Based on Wazuh's official integration framework and MISP integration.
-#
-# Description:
-#   Wazuh - Yeti integration.
-#   Enriches Sysmon/syscheck alerts with Yeti threat intelligence.
-#   Sends Threat Found: Yeti Intel Matches back to Wazuh via socket when a match is found.
+
+#!/usr/bin/env python3
+# ==============================================================================
+# Wazuh → Yeti Threat Intelligence Integration
+# File: /var/ossec/integrations/custom-yeti
+# ==============================================================================
+# This script is called by Wazuh whenever an alert fires.
+# It extracts observables (IPs, domains, hashes, URLs) from the alert,
+# queries Yeti for matching IOCs, and if any are found it injects a new
+# high-severity alert back into Wazuh so the dashboard shows
+# "Threat and IOC Found".
+# ==============================================================================
 
 import json
-import os
-import sys
+import logging
 import re
-from socket import AF_UNIX, SOCK_DGRAM, socket
+import socket
+import sys
+from datetime import datetime, timezone
 
-try:
-    import requests
-    from requests.exceptions import Timeout
-except Exception:
-    print("No module 'requests' found. Install it with: pip install requests")
-    sys.exit(1)
+import requests
 
-# === Exit codes (consistent with Wazuh official style) ===
-ERR_NO_REQUEST_MODULE = 1
-ERR_BAD_ARGUMENTS = 2
-ERR_SOCKET_OPERATION = 3
-ERR_FILE_NOT_FOUND = 4
-ERR_INVALID_JSON = 5
-ERR_YETI_AUTH = 6
-ERR_YETI_RESPONSE = 7
+# ──────────────────────────────────────────────────────────────────────────────
+# Configuration
+# Wazuh calls this script as:
+#   custom-yeti <alert_file> <hook_url> <api_key>
+# Those map to sys.argv[1], sys.argv[2], sys.argv[3] respectively.
+# All three come straight from ossec.conf — no environment variables needed.
+# ──────────────────────────────────────────────────────────────────────────────
+LOG_FILE     = "/var/ossec/logs/yeti-integration.log"
+WAZUH_SOCKET = "/var/ossec/queue/sockets/queue"
 
-# === Globals ===
-debug_enabled = False
-timeout = 10
-retries = 3
-pwd = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
-LOG_FILE = f"{pwd}/logs/integrations.log"
-SOCKET_ADDR = f"{pwd}/queue/sockets/queue"
+# Wazuh rule IDs that should trigger an IOC lookup (empty list = all alerts)
+# Example: TRIGGER_RULE_IDS = {5501, 5502, 31103}
+TRIGGER_RULE_IDS: set = set()
 
-# === Argument indexes ===
-ALERT_INDEX = 1
-APIKEY_INDEX = 2
-YETI_URL_INDEX = 3
+# Minimum Wazuh alert level that triggers an IOC lookup (0 = all alerts)
+MIN_ALERT_LEVEL = 0
 
-# IOC mappings
-IOCS = [
-    ("ip_src", ["src_ip", "source_ip", "srcip", "SourceIP", "client_ip", "IPAddress", "CallerIPAddress"]),
-    ("ip_dst", ["dst_ip", "destination_ip", "dstip", "DestinationIP", "remote_ip", "external_ip"]),
-    ("sha1",   ["sha1", "sha1sum", "file_sha1"]),
-    ("sha256", ["sha256", "sha256sum", "file_sha256"]),
-    ("md5",    ["md5", "md5sum", "file_md5"]),
-    ("url",    ["url", "source_url", "TargetURL", "download_url"]),
-    ("domain", ["domain", "hostname", "base_domain", "fqdn", "TargetDestination"])
-]
+# ──────────────────────────────────────────────────────────────────────────────
+# Logging
+# ──────────────────────────────────────────────────────────────────────────────
+logging.basicConfig(
+    filename=LOG_FILE,
+    level=logging.INFO,
+    format="%(asctime)s  %(levelname)-8s  %(message)s",
+    datefmt="%Y-%m-%dT%H:%M:%S",
+)
+log = logging.getLogger("yeti-integration")
 
 
-# === Utility functions ===
-def debug(msg: str) -> None:
-    """Write debug messages to integration log."""
-    if debug_enabled:
-        print(msg)
-        with open(LOG_FILE, "a") as f:
-            f.write(msg + "\n")
+# ──────────────────────────────────────────────────────────────────────────────
+# Yeti API helpers
+# ──────────────────────────────────────────────────────────────────────────────
+class YetiClient:
+    """Minimal Yeti v2 API client with automatic JWT refresh."""
+
+    def __init__(self, base_url: str, api_key: str):
+        self.base_url = base_url.rstrip("/")
+        self.api_key = api_key
+        self.session = requests.Session()
+        self.session.headers.update({"Content-Type": "application/json"})
+        self._access_token: str | None = None
+
+    # ── Authentication ────────────────────────────────────────────────────────
+    def authenticate(self) -> bool:
+        """Exchange API key for a Bearer JWT access token."""
+        try:
+            resp = self.session.post(
+                f"{self.base_url}/api/v2/auth/api-token",
+                headers={"x-yeti-apikey": self.api_key},
+                timeout=10,
+            )
+            resp.raise_for_status()
+            self._access_token = resp.json().get("access_token")
+            if not self._access_token:
+                log.error("Yeti auth: no access_token in response: %s", resp.text)
+                return False
+            self.session.headers.update(
+                {"Authorization": f"Bearer {self._access_token}"}
+            )
+            log.info("Yeti authentication successful.")
+            return True
+        except Exception as exc:
+            log.error("Yeti authentication failed: %s", exc)
+            return False
+
+    # ── Observable lookup ─────────────────────────────────────────────────────
+    def search_observable(self, value: str) -> list[dict]:
+        """
+        Search Yeti for a single observable value.
+        Returns a list of matching observable objects (may be empty).
+        """
+        if not self._access_token and not self.authenticate():
+            return []
+        try:
+            payload = {
+                "query": {"value": value},
+                "count": 10,
+                "page": 0,
+            }
+            resp = self.session.post(
+                f"{self.base_url}/api/v2/observables/search",
+                json=payload,
+                timeout=10,
+            )
+            if resp.status_code == 401:
+                # Token expired – refresh once
+                log.info("Token expired, re-authenticating …")
+                if self.authenticate():
+                    resp = self.session.post(
+                        f"{self.base_url}/api/v2/observables/search",
+                        json=payload,
+                        timeout=10,
+                    )
+                else:
+                    return []
+            resp.raise_for_status()
+            data = resp.json()
+            return data.get("observables", [])
+        except Exception as exc:
+            log.error("Yeti search_observable(%r) failed: %s", value, exc)
+            return []
+
+    def enrich_observable(self, yeti_id: str) -> dict:
+        """Fetch full observable detail (tags, context, relationships) by ID."""
+        try:
+            resp = self.session.get(
+                f"{self.base_url}/api/v2/observables/{yeti_id}",
+                timeout=10,
+            )
+            resp.raise_for_status()
+            return resp.json()
+        except Exception as exc:
+            log.warning("Could not enrich observable %s: %s", yeti_id, exc)
+            return {}
 
 
-def send_msg(msg: any, agent: any = None) -> None:
-    """Send message back to Wazuh via the UNIX socket."""
-    if not agent or agent.get("id") == "000":
-        string = "1:yeti_integration:{0}".format(json.dumps(msg))
+# ──────────────────────────────────────────────────────────────────────────────
+# Observable extraction from Wazuh alert JSON
+# ──────────────────────────────────────────────────────────────────────────────
+# Regex patterns for each observable type
+_RE_IPV4    = re.compile(r"\b(?:(?:25[0-5]|2[0-4]\d|[01]?\d\d?)\.){3}"
+                         r"(?:25[0-5]|2[0-4]\d|[01]?\d\d?)\b")
+_RE_DOMAIN  = re.compile(r"\b(?:[a-zA-Z0-9](?:[a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?\.)+"
+                         r"[a-zA-Z]{2,}\b")
+_RE_MD5     = re.compile(r"\b[0-9a-fA-F]{32}\b")
+_RE_SHA1    = re.compile(r"\b[0-9a-fA-F]{40}\b")
+_RE_SHA256  = re.compile(r"\b[0-9a-fA-F]{64}\b")
+_RE_URL     = re.compile(r"https?://[^\s\"'<>]+")
+
+def _flatten(obj, prefix="") -> dict[str, str]:
+    """Recursively flatten a nested dict to {dotted.path: value} strings."""
+    flat = {}
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            flat.update(_flatten(v, f"{prefix}.{k}" if prefix else k))
+    elif isinstance(obj, list):
+        for i, v in enumerate(obj):
+            flat.update(_flatten(v, f"{prefix}[{i}]"))
     else:
-        location = "[{0}] ({1}) {2}".format(
-            agent["id"],
-            agent["name"],
-            agent.get("ip", "any")
-        ).replace("|", "||").replace(":", "|:")
-        string = "1:{0}->yeti_integration:{1}".format(location, json.dumps(msg))
+        flat[prefix] = str(obj)
+    return flat
 
-    debug(f"# Sending result back to Wazuh: {string}")
 
+def extract_observables(alert: dict) -> dict[str, set[str]]:
+    """
+    Walk every field in the Wazuh alert JSON and collect candidate observables.
+    Returns a dict keyed by type: {'ip': {...}, 'domain': {...}, 'hash': {...}, 'url': {...}}
+    """
+    ips, domains, hashes, urls = set(), set(), set(), set()
+
+    flat = _flatten(alert)
+    all_values = " ".join(flat.values())
+
+    # ── URLs (extract first, then strip from further analysis) ────────────────
+    for url in _RE_URL.findall(all_values):
+        urls.add(url[:512])  # cap length
+
+    # Strip URLs from the string before hunting for loose IPs / domains
+    stripped = _RE_URL.sub(" ", all_values)
+
+    # ── IPs ───────────────────────────────────────────────────────────────────
+    for ip in _RE_IPV4.findall(stripped):
+        ips.add(ip)
+
+    # ── Domains (avoid false-positives from file paths / Windows paths) ───────
+    for dom in _RE_DOMAIN.findall(stripped):
+        # Filter out obvious non-domains (single TLD artefacts, local names)
+        if "." in dom and not dom.endswith(".log") and not dom.endswith(".conf"):
+            domains.add(dom.lower())
+
+    # ── Hashes (priority: longest first to avoid substring collisions) ────────
+    for h in _RE_SHA256.findall(all_values):
+        hashes.add(h.lower())
+    for h in _RE_SHA1.findall(all_values):
+        hashes.add(h.lower())
+    for h in _RE_MD5.findall(all_values):
+        hashes.add(h.lower())
+
+    return {"ip": ips, "domain": domains, "hash": hashes, "url": urls}
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Wazuh socket – inject a synthetic alert
+# ──────────────────────────────────────────────────────────────────────────────
+def send_to_wazuh(event: dict) -> None:
+    """
+    Write a synthetic alert into the Wazuh manager queue socket.
+    Format expected by the manager:  1:<location>:<json_event>
+    """
     try:
-        sock = socket(AF_UNIX, SOCK_DGRAM)
-        sock.connect(SOCKET_ADDR)
-        sock.send(string.encode())
-        sock.close()
-    except FileNotFoundError:
-        debug(f"# Error: Unable to open socket connection at {SOCKET_ADDR}")
-        sys.exit(ERR_SOCKET_OPERATION)
+        msg = "1:yeti-ioc-integration:" + json.dumps(event)
+        with socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM) as sock:
+            sock.connect(WAZUH_SOCKET)
+            sock.send(msg.encode("utf-8"))
+        log.info("Event sent to Wazuh socket: %s", msg[:200])
+    except Exception as exc:
+        log.error("Failed to send event to Wazuh socket: %s", exc)
 
 
-def get_json_alert(file_location: str) -> any:
-    """Read JSON alert from file."""
-    try:
-        with open(file_location) as alert_file:
-            return json.load(alert_file)
-    except FileNotFoundError:
-        debug(f"# JSON alert file not found at {file_location}")
-        sys.exit(ERR_FILE_NOT_FOUND)
-    except json.decoder.JSONDecodeError as e:
-        debug(f"Failed to parse JSON alert file: {e}")
-        sys.exit(ERR_INVALID_JSON)
+def build_ioc_alert(original_alert: dict, matches: list[dict]) -> dict:
+    """
+    Construct the synthetic alert payload that Wazuh will index and display.
+    The custom rule (rule ID 100200) will surface this as "Threat and IOC Found".
+    """
+    agent  = original_alert.get("agent", {})
+    rule   = original_alert.get("rule", {})
+    ioc_summary = []
 
+    for m in matches:
+        obs   = m.get("observable", {})
+        tags  = [t.get("name", "") for t in obs.get("tags", [])]
+        ioc_summary.append({
+            "value":     obs.get("value", m.get("queried_value", "unknown")),
+            "type":      obs.get("type", "unknown"),
+            "tags":      tags,
+            "context":   obs.get("context", []),
+            "yeti_id":   obs.get("id", ""),
+        })
 
-def get_json_options(file_location: str) -> dict:
-    """Load JSON options from file if exists."""
-    if not file_location:
-        return {}
-    try:
-        with open(file_location) as options_file:
-            return json.load(options_file)
-    except FileNotFoundError:
-        debug(f"# Options file not found at {file_location}")
-        return {}
-    except Exception as e:
-        debug(f"# Failed parsing options JSON: {e}")
-        sys.exit(ERR_INVALID_JSON)
-
-
-def extract_iocs(alert: dict) -> dict:
-    """Extract IOCs from alert JSON based on mapping."""
-    found = {}
-
-    def flatten(obj):
-        flat = {}
-        if isinstance(obj, dict):
-            for k, v in obj.items():
-                flat[k] = v
-                if isinstance(v, dict):
-                    flat.update(flatten(v))
-                elif isinstance(v, list):
-                    for i, it in enumerate(v):
-                        if isinstance(it, dict):
-                            flat.update(flatten(it))
-        return flat
-
-    flat = flatten(alert)
-    for canon, keys in IOCS:
-        vals = set()
-        for key in keys:
-            for k, v in flat.items():
-                if key.lower() in k.lower() and isinstance(v, (str, int, float)):
-                    vals.add(str(v))
-        if vals:
-            found[canon] = list(vals)
-    return found
-
-
-def get_yeti_token(yeti_url, api_key):
-    """Authenticate to Yeti using API key -> JWT token."""
-    try:
-        response = requests.post(
-            f"{yeti_url.rstrip('/')}/auth/api-token",
-            headers={"x-yeti-apikey": api_key},
-            timeout=timeout
-        )
-        if response.status_code not in (200, 201):
-            raise Exception(f"Bad status {response.status_code}: {response.text}")
-        data = response.json()
-        token = data.get("access_token") or data.get("token")
-        if not token:
-            raise Exception("No token returned from Yeti")
-        return token
-    except Exception as e:
-        debug(f"# Error authenticating to Yeti: {e}")
-        sys.exit(ERR_YETI_AUTH)
-
-
-def query_yeti(yeti_url, token, value):
-    """Query Yeti for an observable."""
-    headers = {"Authorization": f"Bearer {token}"}
-    try:
-        response = requests.get(
-            f"{yeti_url.rstrip('/')}/observables?value={value}",
-            headers=headers,
-            timeout=timeout
-        )
-        if response.status_code == 200 and response.text.strip():
-            return response.json()
-        return {}
-    except Timeout:
-        debug("# Error: Yeti query timed out")
-        return {}
-    except Exception as e:
-        debug(f"# Error querying Yeti: {e}")
-        return {}
-
-
-def process_alert(alert, yeti_url, api_key):
-    """Main logic â€” extract IOCs, query Yeti, and send alert if found."""
-    token = get_yeti_token(yeti_url, api_key)
-    iocs = extract_iocs(alert)
-
-    if not iocs:
-        debug("# No IOCs found in alert.")
-        return
-
-    matches = []
-    for ioc_type, values in iocs.items():
-        for val in values:
-            res = query_yeti(yeti_url, token, val)
-            if res:
-                matches.append({"ioc": val, "type": ioc_type, "result": res})
-
-    msg = {
-        "integration": "yeti_integration",
-        "event": "Threat Found: Yeti Intel Match",
-        "found": len(matches),
-        "yeti_matches": matches
+    return {
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "integration": "yeti",
+        "yeti": {
+            "result": "Threat and IOC Found",
+            "ioc_count": len(ioc_summary),
+            "iocs": ioc_summary,
+            "source_rule": {
+                "id":    rule.get("id", ""),
+                "level": rule.get("level", ""),
+                "description": rule.get("description", ""),
+            },
+        },
+        "agent": {
+            "id":   agent.get("id", ""),
+            "name": agent.get("name", ""),
+            "ip":   agent.get("ip", ""),
+        },
+        "original_alert_id": original_alert.get("id", ""),
     }
 
-    if matches:
-        debug(f"# Threat Found: {len(matches)} match(es) found in Yeti.")
-        send_msg(msg, alert.get("agent"))
-    else:
-        debug("# No matches found in Yeti.")
 
+# ──────────────────────────────────────────────────────────────────────────────
+# Main entry point
+# ──────────────────────────────────────────────────────────────────────────────
+def main():
+    # Wazuh calls:  custom-yeti <alert_file> <hook_url> <api_key>
+    if len(sys.argv) < 4:
+        log.error("Usage: custom-yeti <alert_file> <yeti_url> <api_key>")
+        sys.exit(1)
 
-def main(args):
-    global debug_enabled
-    global timeout
-    global retries
+    alert_file = sys.argv[1]
+    YETI_URL   = sys.argv[2].rstrip("/")
+    YETI_APIKEY = sys.argv[3]
+    try:
+        with open(alert_file, "r", encoding="utf-8") as fh:
+            alert = json.load(fh)
+    except Exception as exc:
+        log.error("Cannot read alert file %r: %s", alert_file, exc)
+        sys.exit(1)
 
-    if len(args) < 4:
-        print("Usage: custom-yeti.py <alert_file> <api_key> <yeti_url> [options]")
-        sys.exit(ERR_BAD_ARGUMENTS)
+    # ── Filtering: skip if rule ID / level doesn't meet threshold ─────────────
+    rule_id    = int(alert.get("rule", {}).get("id", 0))
+    rule_level = int(alert.get("rule", {}).get("level", 0))
 
-    alert_file = args[ALERT_INDEX]
-    api_key = args[APIKEY_INDEX]
-    yeti_url = args[YETI_URL_INDEX]
+    if TRIGGER_RULE_IDS and rule_id not in TRIGGER_RULE_IDS:
+        log.debug("Rule %d not in TRIGGER_RULE_IDS – skipping.", rule_id)
+        sys.exit(0)
 
-    # Locate optional options file
-    options_file = ""
-    for arg in args[4:]:
-        if arg.endswith("options"):
-            options_file = arg
-            break
+    if rule_level < MIN_ALERT_LEVEL:
+        log.debug("Rule level %d below MIN_ALERT_LEVEL %d – skipping.",
+                  rule_level, MIN_ALERT_LEVEL)
+        sys.exit(0)
 
-    json_options = get_json_options(options_file)
-    debug(f"# Loaded options: {json_options}")
+    log.info("Processing alert: rule=%d level=%d agent=%s",
+             rule_id, rule_level, alert.get("agent", {}).get("name", "?"))
 
-    # Apply options
-    if "timeout" in json_options and isinstance(json_options["timeout"], int):
-        timeout = json_options["timeout"]
+    # ── Observable extraction ──────────────────────────────────────────────────
+    observables = extract_observables(alert)
+    all_values  = (
+        observables["ip"]     |
+        observables["domain"] |
+        observables["hash"]   |
+        observables["url"]
+    )
 
-    if "retries" in json_options and isinstance(json_options["retries"], int):
-        retries = json_options["retries"]
+    if not all_values:
+        log.info("No observables found in alert %d – skipping.", rule_id)
+        sys.exit(0)
 
-    if "debug" in json_options and isinstance(json_options["debug"], bool):
-        debug_enabled = json_options["debug"]
+    log.info("Extracted %d observable(s): %s",
+             len(all_values), ", ".join(list(all_values)[:10]))
 
-    alert = get_json_alert(alert_file)
-    process_alert(alert, yeti_url, api_key)
+    # ── Yeti lookups ───────────────────────────────────────────────────────────
+    client = YetiClient(YETI_URL, YETI_APIKEY)
+    matches = []
+
+    for value in all_values:
+        results = client.search_observable(value)
+        for obs in results:
+            log.info("IOC MATCH: %r → %s (tags: %s)",
+                     value,
+                     obs.get("value", "?"),
+                     [t.get("name") for t in obs.get("tags", [])])
+            matches.append({"queried_value": value, "observable": obs})
+
+    # ── Report findings ────────────────────────────────────────────────────────
+    if not matches:
+        log.info("No IOC matches for alert %d.", rule_id)
+        sys.exit(0)
+
+    log.warning("THREAT DETECTED – %d IOC(s) matched for alert %d",
+                len(matches), rule_id)
+
+    ioc_alert = build_ioc_alert(alert, matches)
+    send_to_wazuh(ioc_alert)
+    sys.exit(0)
 
 
 if __name__ == "__main__":
-    main(sys.argv)
-
+    main()      
