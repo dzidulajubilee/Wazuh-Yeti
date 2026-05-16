@@ -15,7 +15,7 @@ Wazuh Agent  ──►  Wazuh Manager  ──►  custom-yeti script
                                               ▼
                                       Yeti  /api/v2/observables/search
                                               │
-                              IOC found?  ◄──┘
+                              IOC found?   ◄──┘ 
                                     │
                                     ▼
                       Wazuh queue socket  ──►  Rule 100201 fires
