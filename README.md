@@ -76,11 +76,11 @@ All IPs are looked up without exception, including private and loopback ranges â
 
 ```bash
 # Copy the script
-cp integrations/custom-yeti /var/ossec/integrations/custom-yeti
+cp integrations/custom-yeti /var/ossec/integrations/custom-yeti.py
 
 # The file must be owned by root and executable
-chmod 750  /var/ossec/integrations/custom-yeti
-chown root:wazuh /var/ossec/integrations/custom-yeti
+chmod 750  /var/ossec/integrations/custom-yeti.py
+chown root:wazuh /var/ossec/integrations/custom-yeti.py
 ```
 
 ### 2 â€“ Copy the decoder
